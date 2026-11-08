@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -155,6 +156,7 @@ func (r *parallelReader) fetch(idx int) {
 	}
 	if err != nil {
 		r.err = err
+		r.cancel() // Stop sibling requests and retry waits on a terminal error.
 		r.cond.Broadcast()
 		return
 	}
@@ -163,11 +165,11 @@ func (r *parallelReader) fetch(idx int) {
 	r.cond.Broadcast()
 }
 
-func (r *parallelReader) doRangeGet(br byteRange) ([]byte, error) {
+func (r *parallelReader) doRangeGetOnce(ctx context.Context, br byteRange) ([]byte, bool, error) {
 	want := br.End - br.Start
-	req, err := http.NewRequestWithContext(r.ctx, http.MethodGet, r.url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("downloader: range request: %w", err)
+		return nil, false, fmt.Errorf("downloader: range request: %w", err)
 	}
 	applyHeaders(req, r.cfg.Header)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", br.Start, br.End-1))
@@ -177,35 +179,37 @@ func (r *parallelReader) doRangeGet(br byteRange) ([]byte, error) {
 
 	resp, err := r.cfg.HTTPClient.Do(req)
 	if err != nil {
-		if r.ctx.Err() != nil {
-			return nil, r.ctx.Err()
+		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+			err = errors.Join(err, ctxErr)
 		}
-		return nil, fmt.Errorf("downloader: range GET [%d-%d): %w", br.Start, br.End, err)
+		return nil, retryableNetworkError(err), fmt.Errorf("downloader: range GET [%d-%d): %w", br.Start, br.End, err)
 	}
 	defer resp.Body.Close()
 
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
 		data, err := io.ReadAll(io.LimitReader(resp.Body, want+1))
+		if int64(len(data)) > want {
+			return nil, false, fmt.Errorf("downloader: range [%d-%d): got %d bytes, want %d", br.Start, br.End, len(data), want)
+		}
 		if err != nil {
-			if r.ctx.Err() != nil {
-				return nil, r.ctx.Err()
+			if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+				err = errors.Join(err, ctxErr)
 			}
-			return nil, fmt.Errorf("downloader: reading range [%d-%d): %w", br.Start, br.End, err)
+			return nil, retryableNetworkError(err), fmt.Errorf("downloader: reading range [%d-%d): %w", br.Start, br.End, err)
 		}
-		if int64(len(data)) != want {
-			return nil, fmt.Errorf("downloader: range [%d-%d): got %d bytes, want %d", br.Start, br.End, len(data), want)
+		if int64(len(data)) < want {
+			return nil, true, fmt.Errorf("downloader: range [%d-%d): got %d bytes, want %d: %w", br.Start, br.End, len(data), want, io.ErrUnexpectedEOF)
 		}
-		return data, nil
+		return data, false, nil
 
 	case http.StatusOK:
 		// Server ignored Range — refuse to stitch (correctness invariant #4).
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<20))
-		return nil, fmt.Errorf("downloader: server returned 200 for Range [%d-%d); refusing to stitch", br.Start, br.End)
+		return nil, false, fmt.Errorf("downloader: server returned 200 for Range [%d-%d); refusing to stitch", br.Start, br.End)
 
 	default:
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<20))
-		return nil, fmt.Errorf("downloader: range GET [%d-%d): status %s", br.Start, br.End, resp.Status)
+		// Close rather than drain error bodies: they may be large or stalled.
+		return nil, retryableStatus(resp.StatusCode), fmt.Errorf("downloader: range GET [%d-%d): status %s", br.Start, br.End, resp.Status)
 	}
 }
 

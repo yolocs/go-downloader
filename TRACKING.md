@@ -31,7 +31,7 @@ Add new items at the end of the matching section as ideas appear.
 
 ## Production hardening
 
-- [ ] Per-chunk retries with backoff / timeouts
+- [x] ~~Per-chunk retries with backoff / timeouts~~
 - [ ] Handle `416` and `200`-on-`Range` safely (no mismatched stitch)
 - [ ] Memory / prefetch caps (`PrefetchWindow`, `BufferMemoryLimit`)
 - [ ] Progress hook (`WithProgress`)

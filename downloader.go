@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 )
 
 // Default tuning knobs. Safe starting points; override via Option.
@@ -40,10 +41,17 @@ type Progress struct {
 }
 
 // RetryPolicy controls per-chunk retry behavior.
-// Zero value means "use package defaults" once implemented.
+// Zero-valued fields use defaults: 3 attempts, 100 ms initial backoff,
+// 2 s maximum backoff, and a 30 s timeout per attempt.
 type RetryPolicy struct {
+	// MaxAttempts includes the initial request. One disables retries.
 	MaxAttempts int
-	// Future: backoff strategy, retryable status codes, etc.
+	// InitialBackoff is the delay before the first retry.
+	InitialBackoff time.Duration
+	// MaxBackoff caps the exponentially increasing delay.
+	MaxBackoff time.Duration
+	// AttemptTimeout bounds each Range request, including reading its body.
+	AttemptTimeout time.Duration
 }
 
 // Config holds resolved options for a download.
@@ -104,6 +112,7 @@ func WithHeader(key, value string) Option {
 }
 
 // WithRetry sets the per-chunk retry policy.
+// It applies only to parallel Range requests, not the probe or fallback GET.
 func WithRetry(policy RetryPolicy) Option {
 	return func(c *Config) {
 		c.Retry = policy
@@ -196,5 +205,5 @@ func validateConfig(c *Config) error {
 	if c.HTTPClient == nil {
 		return fmt.Errorf("downloader: HTTPClient must not be nil")
 	}
-	return nil
+	return normalizeRetryPolicy(&c.Retry)
 }

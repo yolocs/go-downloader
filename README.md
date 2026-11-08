@@ -121,10 +121,42 @@ func WithProgress(fn func(Progress)) Option
 | Chunk size | 2 MiB | Balance request overhead vs parallelism |
 | Concurrency | 4 | Safe for most origins; user can raise |
 | Prefetch window | 4 chunks | ~8 MiB readahead |
-| Retry | 3× exponential | Typical transient blips |
+| Retry | 3 total attempts | Exponential backoff from 100 ms, capped at 2 s |
+| Attempt timeout | 30 s | Includes headers and body for each Range request |
 | Parallel threshold | 8 MiB | Below this, single GET |
 
 Defaults stay boring and safe; throughput tuning is opt-in.
+
+### Chunk retries and timeouts
+
+Parallel chunks retry HTTP 408, 429, 500, 502, 503, and 504 responses,
+transient network failures, truncated bodies, and attempt timeouts. Each
+attempt restarts the same range; partial bytes from a failed attempt are
+discarded. Other statuses (including `200` on Range and `416`) fail
+immediately. An exhausted or permanent failure cancels other workers and
+is returned by `Read`, with underlying errors preserved for `errors.Is`
+and `errors.As`.
+
+```go
+r, err := downloader.Open(ctx, url,
+    downloader.WithRetry(downloader.RetryPolicy{
+        MaxAttempts:    5, // includes the initial attempt; 1 disables retries
+        InitialBackoff: 200 * time.Millisecond,
+        MaxBackoff:     3 * time.Second,
+        AttemptTimeout: 20 * time.Second,
+    }),
+)
+```
+
+Zero-valued policy fields use the defaults above. Negative values and a
+maximum backoff below the initial backoff are rejected before any request.
+Parent context cancellation and `Close` interrupt requests and retry waits.
+Retries keep their worker slot, so concurrency and prefetch limits still
+apply. A custom `http.Client.Timeout` may impose a shorter timeout.
+
+This policy applies to parallel Range requests; probe and single-stream
+fallback GETs retain their existing behavior. Backoff is exponential without
+jitter and does not interpret `Retry-After` headers.
 
 ## Use cases
 
