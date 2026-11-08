@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"time"
 )
@@ -85,8 +86,8 @@ func WithConcurrency(n int) Option {
 	}
 }
 
-// WithPrefetchWindow sets how many chunks may be buffered ahead of the
-// read cursor.
+// WithPrefetchWindow caps admitted chunks, including active requests, queued
+// chunks, and the partially consumed current chunk. It must be positive.
 func WithPrefetchWindow(n int) Option {
 	return func(c *Config) {
 		c.PrefetchWindow = n
@@ -119,8 +120,12 @@ func WithRetry(policy RetryPolicy) Option {
 	}
 }
 
-// WithBufferMemoryLimit caps approximate in-memory readahead in bytes.
-// Zero means "derive from chunk size × prefetch window".
+// WithBufferMemoryLimit caps chunk payload storage in bytes, including active
+// requests, queued chunks, and the partially consumed current chunk. Zero derives
+// the limit from ChunkSize * PrefetchWindow. A positive limit must be at least
+// ChunkSize. Negative limits and an overflowing derived limit are rejected.
+// The limit excludes HTTP/runtime overhead, chunk metadata, and caller buffers;
+// it does not apply to the probe or single-stream fallback.
 func WithBufferMemoryLimit(n int64) Option {
 	return func(c *Config) {
 		c.BufferMemoryLimit = n
@@ -201,6 +206,18 @@ func validateConfig(c *Config) error {
 	}
 	if c.PrefetchWindow <= 0 {
 		return fmt.Errorf("downloader: PrefetchWindow must be > 0")
+	}
+	if c.BufferMemoryLimit < 0 {
+		return fmt.Errorf("downloader: BufferMemoryLimit must not be negative")
+	}
+	if c.BufferMemoryLimit == 0 {
+		if c.ChunkSize > math.MaxInt64/int64(c.PrefetchWindow) {
+			return fmt.Errorf("downloader: derived BufferMemoryLimit overflows int64")
+		}
+		c.BufferMemoryLimit = c.ChunkSize * int64(c.PrefetchWindow)
+	}
+	if c.BufferMemoryLimit < c.ChunkSize {
+		return fmt.Errorf("downloader: BufferMemoryLimit must be >= ChunkSize")
 	}
 	if c.HTTPClient == nil {
 		return fmt.Errorf("downloader: HTTPClient must not be nil")

@@ -28,6 +28,7 @@ type parallelReader struct {
 	nextToFetch   int
 	nextToDeliver int
 	inflight      int
+	reservedBytes int64    // active, queued, and current chunk payloads
 	slots         [][]byte // indexed by chunk; nil = not ready
 	buf           []byte   // remainder of the chunk currently being read
 	err           error
@@ -77,6 +78,15 @@ func (r *parallelReader) Read(p []byte) (int, error) {
 		if len(r.buf) > 0 {
 			n := copy(p, r.buf)
 			r.buf = r.buf[n:]
+			if len(r.buf) == 0 {
+				// Slicing off a prefix retains the whole backing allocation.
+				// Release its reservation only after the chunk is fully read.
+				r.buf = nil
+				br := r.ranges[r.nextToDeliver]
+				r.reservedBytes -= br.End - br.Start
+				r.nextToDeliver++
+				r.scheduleLocked()
+			}
 			return n, nil
 		}
 		if r.nextToDeliver >= len(r.ranges) {
@@ -87,13 +97,8 @@ func (r *parallelReader) Read(p []byte) (int, error) {
 		}
 		if data := r.slots[r.nextToDeliver]; data != nil {
 			r.slots[r.nextToDeliver] = nil
-			r.nextToDeliver++
 			r.buf = data
-			r.scheduleLocked()
-			r.cond.Broadcast()
-			n := copy(p, r.buf)
-			r.buf = r.buf[n:]
-			return n, nil
+			continue
 		}
 		if r.err != nil {
 			return 0, r.err
@@ -111,6 +116,7 @@ func (r *parallelReader) Close() error {
 	r.closed = true
 	r.cancel()
 	r.buf = nil
+	r.reservedBytes = 0
 	for i := range r.slots {
 		r.slots[i] = nil
 	}
@@ -128,8 +134,14 @@ func (r *parallelReader) scheduleLocked() {
 	}
 	for r.inflight < r.cfg.Concurrency &&
 		r.nextToFetch < len(r.ranges) &&
-		r.nextToFetch < r.nextToDeliver+r.cfg.PrefetchWindow {
+		r.nextToFetch-r.nextToDeliver < r.cfg.PrefetchWindow {
 		idx := r.nextToFetch
+		br := r.ranges[idx]
+		want := br.End - br.Start
+		if want > r.cfg.BufferMemoryLimit-r.reservedBytes {
+			break
+		}
+		r.reservedBytes += want
 		r.nextToFetch++
 		r.inflight++
 		r.wg.Add(1)
@@ -150,11 +162,12 @@ func (r *parallelReader) fetch(idx int) {
 		return
 	}
 	if r.err != nil {
-		r.scheduleLocked()
+		r.reservedBytes -= br.End - br.Start
 		r.cond.Broadcast()
 		return
 	}
 	if err != nil {
+		r.reservedBytes -= br.End - br.Start
 		r.err = err
 		r.cancel() // Stop sibling requests and retry waits on a terminal error.
 		r.cond.Broadcast()
@@ -165,7 +178,7 @@ func (r *parallelReader) fetch(idx int) {
 	r.cond.Broadcast()
 }
 
-func (r *parallelReader) doRangeGetOnce(ctx context.Context, br byteRange) ([]byte, bool, error) {
+func (r *parallelReader) doRangeGetOnce(ctx context.Context, br byteRange, data []byte) ([]byte, bool, error) {
 	want := br.End - br.Start
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.url, nil)
 	if err != nil {
@@ -193,18 +206,41 @@ func (r *parallelReader) doRangeGetOnce(ctx context.Context, br byteRange) ([]by
 		if !ok || start != br.Start || end != br.End-1 || total != r.size {
 			return nil, false, fmt.Errorf("downloader: range [%d-%d): invalid Content-Range %q; want bytes %d-%d/%d", br.Start, br.End, contentRange, br.Start, br.End-1, r.size)
 		}
-		data, err := io.ReadAll(io.LimitReader(resp.Body, want+1))
-		if int64(len(data)) > want {
-			return nil, false, fmt.Errorf("downloader: range [%d-%d): got %d bytes, want %d", br.Start, br.End, len(data), want)
+		var n int
+		var readErr error
+		var tail [2]byte
+		for readErr == nil {
+			// Read the final payload byte and possible excess into a stack
+			// buffer, so even excess returned with an error is detected.
+			var dst []byte
+			if n < len(data)-1 {
+				dst = data[n : len(data)-1]
+			} else {
+				dst = tail[n-len(data)+1:]
+			}
+			var m int
+			m, readErr = resp.Body.Read(dst)
+			if n+m > len(data) {
+				return nil, false, fmt.Errorf("downloader: range [%d-%d): got more than %d bytes", br.Start, br.End, want)
+			}
+			if n == len(data)-1 && m > 0 {
+				data[n] = tail[0]
+			}
+			n += m
 		}
+		if readErr == io.EOF {
+			if n == len(data) {
+				readErr = nil
+			} else {
+				readErr = io.ErrUnexpectedEOF
+			}
+		}
+		err = readErr
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
 				err = errors.Join(err, ctxErr)
 			}
 			return nil, retryableNetworkError(err), fmt.Errorf("downloader: reading range [%d-%d): %w", br.Start, br.End, err)
-		}
-		if int64(len(data)) < want {
-			return nil, true, fmt.Errorf("downloader: range [%d-%d): got %d bytes, want %d: %w", br.Start, br.End, len(data), want, io.ErrUnexpectedEOF)
 		}
 		return data, false, nil
 

@@ -67,11 +67,33 @@ readahead) and are tracked as later adaptations.
 ### Concurrency and memory
 
 - Cap inflight requests with `Concurrency`.
-- Cap buffered unread bytes with `PrefetchWindow * ChunkSize` (and/or
-  `BufferMemoryLimit`).
+- Cap admitted chunks with `PrefetchWindow`, including active requests,
+  completed chunks waiting in order, and the partially consumed current chunk.
+- Cap chunk payload storage with `BufferMemoryLimit`; zero derives the budget
+  from `PrefetchWindow * ChunkSize` (8 MiB with the defaults).
 - When the buffer is full, stop issuing new Range requests until `Read`
-  consumes data.
+  fully consumes a chunk. A partial read retains that chunk's full reservation
+  because its backing allocation is still live.
 - `Close` cancels inflight work and drops buffers promptly.
+
+```go
+r, err := downloader.Open(ctx, url,
+    downloader.WithChunkSize(2<<20),
+    downloader.WithPrefetchWindow(8),
+    downloader.WithBufferMemoryLimit(6<<20), // at most three full chunks
+)
+```
+
+Both caps apply together, so a smaller memory budget can reduce effective
+concurrency. The final short chunk reserves only its actual length. Each chunk
+uses an exact-size payload buffer, reused across retries. Negative limits,
+positive limits below `ChunkSize`, and an overflowing derived budget are rejected
+before any request; `PrefetchWindow` must be positive.
+
+The memory budget bounds chunk payload buffers, not total process memory: it
+excludes HTTP/transport and Go runtime overhead, caller-owned buffers, and
+per-object chunk metadata. Probe and single-stream fallback requests retain
+their streaming behavior and do not use the parallel buffer budget.
 
 ### Errors
 
@@ -121,6 +143,7 @@ func WithProgress(fn func(Progress)) Option
 | Chunk size | 2 MiB | Balance request overhead vs parallelism |
 | Concurrency | 4 | Safe for most origins; user can raise |
 | Prefetch window | 4 chunks | ~8 MiB readahead |
+| Buffer memory limit | Derived from chunk size × prefetch window | 8 MiB of chunk payload storage |
 | Retry | 3 total attempts | Exponential backoff from 100 ms, capped at 2 s |
 | Attempt timeout | 30 s | Includes headers and body for each Range request |
 | Parallel threshold | 8 MiB | Below this, single GET |

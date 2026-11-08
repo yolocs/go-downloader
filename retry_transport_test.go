@@ -285,10 +285,15 @@ func TestChunkAttemptTimeoutPreservesOriginalError(t *testing.T) {
 	}
 }
 
-type oversizedErrorBody struct{}
+type oversizedErrorBody struct{ read int }
 
-func (oversizedErrorBody) Read(p []byte) (int, error) {
-	return copy(p, "12345678"), io.ErrUnexpectedEOF
+func (b *oversizedErrorBody) Read(p []byte) (int, error) {
+	n := copy(p, "12345678"[b.read:])
+	b.read += n
+	if b.read == 8 {
+		return n, io.ErrUnexpectedEOF
+	}
+	return n, nil
 }
 func (oversizedErrorBody) Close() error { return nil }
 
@@ -299,7 +304,7 @@ func TestChunkOversizedBodyWithReadErrorIsNotRetried(t *testing.T) {
 	cfg.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		attempts.Add(1)
 		return &http.Response{StatusCode: http.StatusPartialContent,
-			Body: oversizedErrorBody{}, Header: http.Header{"Content-Range": {"bytes 0-6/7"}}}, nil
+			Body: &oversizedErrorBody{}, Header: http.Header{"Content-Range": {"bytes 0-6/7"}}}, nil
 	})}
 	if err := validateConfig(&cfg); err != nil {
 		t.Fatal(err)

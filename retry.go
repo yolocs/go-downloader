@@ -66,16 +66,21 @@ func nextBackoff(delay, limit time.Duration) time.Duration {
 }
 
 // doRangeGet retries a chunk without relinquishing its worker slot. Each
-// attempt owns a new buffer; only a complete successful result is published.
+// attempt reuses the chunk's reserved buffer; only a complete successful
+// result is published.
 func (r *parallelReader) doRangeGet(br byteRange) ([]byte, error) {
 	policy := r.cfg.Retry
 	delay := policy.InitialBackoff
+	if err := r.ctx.Err(); err != nil {
+		return nil, err
+	}
+	data := make([]byte, br.End-br.Start)
 	for attempt := 1; ; attempt++ {
 		if err := r.ctx.Err(); err != nil {
 			return nil, err
 		}
 		ctx, cancel := context.WithTimeout(r.ctx, policy.AttemptTimeout)
-		data, retryable, err := r.doRangeGetOnce(ctx, br)
+		_, retryable, err := r.doRangeGetOnce(ctx, br, data)
 		cancel()
 		if parentErr := r.ctx.Err(); parentErr != nil {
 			return nil, parentErr
