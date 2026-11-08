@@ -106,6 +106,7 @@ type Reader interface {
 func WithChunkSize(n int64) Option
 func WithConcurrency(n int) Option
 func WithPrefetchWindow(n int) Option
+func WithParallelThreshold(n int64) Option
 func WithHTTPClient(c *http.Client) Option
 func WithHeader(key, value string) Option
 func WithRetry(policy RetryPolicy) Option

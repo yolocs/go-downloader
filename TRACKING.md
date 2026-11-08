@@ -20,14 +20,14 @@ Add new items at the end of the matching section as ideas appear.
 
 ## MVP — sequential parallel Range reader
 
-- [ ] Probe size / Range support (`HEAD` or ranged probe)
-- [ ] Chunk planner (fixed-size ranges over `[0, Size)`)
-- [ ] Bounded worker pool for parallel `Range` GETs
-- [ ] Ordered reorder buffer feeding `Read`
-- [ ] `Close` + parent context cancelation (no goroutine leaks)
-- [ ] Fallback to single streaming GET when Range unsupported / size unknown
-- [ ] Happy-path tests against Range-capable `httptest` server
-- [ ] Benchmarks vs naive `http.Get` (synthetic latency)
+- [x] ~~Probe size / Range support (`HEAD` or ranged probe)~~
+- [x] ~~Chunk planner (fixed-size ranges over `[0, Size)`)~~
+- [x] ~~Bounded worker pool for parallel `Range` GETs~~
+- [x] ~~Ordered reorder buffer feeding `Read`~~
+- [x] ~~`Close` + parent context cancelation (no goroutine leaks)~~
+- [x] ~~Fallback to single streaming GET when Range unsupported / size unknown~~
+- [x] ~~Happy-path tests against Range-capable `httptest` server~~
+- [x] ~~Benchmarks vs naive `http.Get` (synthetic latency)~~
 
 ## Production hardening
 
@@ -35,7 +35,7 @@ Add new items at the end of the matching section as ideas appear.
 - [ ] Handle `416` and `200`-on-`Range` safely (no mismatched stitch)
 - [ ] Memory / prefetch caps (`PrefetchWindow`, `BufferMemoryLimit`)
 - [ ] Progress hook (`WithProgress`)
-- [ ] Small-file fast path (below parallel threshold → single GET)
+- [x] ~~Small-file fast path (below parallel threshold → single GET)~~
 - [ ] ETag / size consistency checks mid-download
 - [ ] Bit-identical correctness tests vs single-stream download
 
