@@ -126,6 +126,14 @@ func WithProgress(fn func(Progress)) Option {
 	}
 }
 
+// WithParallelThreshold sets the minimum object size (bytes) required to
+// use parallel Range GETs. Smaller objects use a single streaming GET.
+func WithParallelThreshold(n int64) Option {
+	return func(c *Config) {
+		c.ParallelThreshold = n
+	}
+}
+
 func defaultConfig() Config {
 	return Config{
 		ChunkSize:         DefaultChunkSize,
@@ -141,9 +149,10 @@ func defaultConfig() Config {
 
 // Open begins a download of url and returns a sequential reader.
 //
-// The implementation will probe Range support, prefetch chunks in
-// parallel, and reassemble them in order. Until Phase 1 lands, Open
-// returns an error explaining that the downloader is not implemented.
+// Open probes Range support, then either prefetches fixed-size byte
+// ranges in parallel (reassembled in order) or falls back to a single
+// streaming GET when Range is unavailable, size is unknown, or the
+// object is below ParallelThreshold.
 func Open(ctx context.Context, url string, opts ...Option) (Reader, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("downloader: nil context")
@@ -162,9 +171,16 @@ func Open(ctx context.Context, url string, opts ...Option) (Reader, error) {
 		return nil, err
 	}
 
-	// Phase 1: probe → plan → fetch → ordered Read.
-	_ = cfg
-	return nil, fmt.Errorf("downloader: Open not implemented yet; see TRACKING.md")
+	info, err := probe(ctx, cfg.HTTPClient, url, cfg.Header)
+	if err != nil {
+		return nil, err
+	}
+
+	useParallel := info.AcceptRanges && info.Size > 0 && info.Size >= cfg.ParallelThreshold
+	if !useParallel {
+		return openFallback(ctx, cfg, url, info.Size)
+	}
+	return openParallelReader(ctx, cfg, url, info)
 }
 
 func validateConfig(c *Config) error {
