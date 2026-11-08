@@ -165,6 +165,7 @@ func TestChunkRetryAttemptTimeout(t *testing.T) {
 				n := attempts.Add(1)
 				if n == 1 || !recover {
 					w.Header().Set("Content-Length", "7")
+					w.Header().Set("Content-Range", "bytes 0-6/7")
 					w.WriteHeader(http.StatusPartialContent)
 					w.(http.Flusher).Flush()
 					<-r.Context().Done() // Headers arrive, but the body stalls.

@@ -122,40 +122,45 @@ func TestChunkRetryClosesErrorBodyWithoutDraining(t *testing.T) {
 }
 
 func TestChunkFailureCancelsSiblings(t *testing.T) {
-	t.Parallel()
-	started, canceled := make(chan struct{}), make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Header.Get("Range") {
-		case "bytes=0-0":
-			serveRange(w, r, []byte("01234567"), nil)
-		case "bytes=0-3":
-			select {
-			case <-started:
-				http.Error(w, "permanent", http.StatusNotFound)
-			case <-r.Context().Done():
+	for _, status := range []int{http.StatusNotFound, http.StatusOK, http.StatusRequestedRangeNotSatisfiable, http.StatusPartialContent} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			t.Parallel()
+			started, canceled := make(chan struct{}), make(chan struct{})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Header.Get("Range") {
+				case "bytes=0-0":
+					serveRange(w, r, []byte("01234567"), nil)
+				case "bytes=0-3":
+					select {
+					case <-started:
+						// A 206 without Content-Range is also a permanent failure.
+						http.Error(w, "permanent", status)
+					case <-r.Context().Done():
+					}
+				case "bytes=4-7":
+					close(started)
+					<-r.Context().Done()
+					close(canceled)
+				}
+			}))
+			defer srv.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			r, err := Open(ctx, srv.URL, WithHTTPClient(srv.Client()), WithChunkSize(4),
+				WithConcurrency(2), WithParallelThreshold(1))
+			if err != nil {
+				t.Fatal(err)
 			}
-		case "bytes=4-7":
-			close(started)
-			<-r.Context().Done()
-			close(canceled)
-		}
-	}))
-	defer srv.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	r, err := Open(ctx, srv.URL, WithHTTPClient(srv.Client()), WithChunkSize(4),
-		WithConcurrency(2), WithParallelThreshold(1))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-	if _, err := io.ReadAll(r); err == nil || errors.Is(err, context.Canceled) {
-		t.Fatalf("Read error = %v, want original permanent failure", err)
-	}
-	select {
-	case <-canceled:
-	case <-time.After(time.Second):
-		t.Fatal("terminal error did not cancel sibling request")
+			defer r.Close()
+			if _, err := io.ReadAll(r); err == nil || errors.Is(err, context.Canceled) {
+				t.Fatalf("Read error = %v, want original permanent failure", err)
+			}
+			select {
+			case <-canceled:
+			case <-time.After(time.Second):
+				t.Fatal("terminal error did not cancel sibling request")
+			}
+		})
 	}
 }
 
@@ -168,6 +173,7 @@ func TestChunkOversizedBodyIsNotRetried(t *testing.T) {
 			return
 		}
 		attempts.Add(1)
+		w.Header().Set("Content-Range", "bytes 0-6/7")
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = w.Write([]byte("too many bytes"))
 	}))
@@ -247,7 +253,7 @@ func TestChunkAttemptTimeoutPreservesOriginalError(t *testing.T) {
 			cfg.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				if bodyTimeout {
 					return &http.Response{StatusCode: http.StatusPartialContent,
-						Body: deadlineBody{req.Context(), bodyErr}, Header: make(http.Header)}, nil
+						Body: deadlineBody{req.Context(), bodyErr}, Header: http.Header{"Content-Range": {"bytes 0-6/7"}}}, nil
 				}
 				<-req.Context().Done()
 				return nil, req.Context().Err()
@@ -293,7 +299,7 @@ func TestChunkOversizedBodyWithReadErrorIsNotRetried(t *testing.T) {
 	cfg.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		attempts.Add(1)
 		return &http.Response{StatusCode: http.StatusPartialContent,
-			Body: oversizedErrorBody{}, Header: make(http.Header)}, nil
+			Body: oversizedErrorBody{}, Header: http.Header{"Content-Range": {"bytes 0-6/7"}}}, nil
 	})}
 	if err := validateConfig(&cfg); err != nil {
 		t.Fatal(err)

@@ -107,7 +107,7 @@ func TestPlanChunks(t *testing.T) {
 	}
 }
 
-func TestParseContentRangeTotal(t *testing.T) {
+func TestParseContentRange(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		in   string
@@ -121,7 +121,7 @@ func TestParseContentRangeTotal(t *testing.T) {
 		{"bytes 0-0/", -1, false},
 	}
 	for _, tc := range cases {
-		size, ok := parseContentRangeTotal(tc.in)
+		_, _, size, ok := parseContentRange(tc.in)
 		if ok != tc.ok || size != tc.size {
 			t.Fatalf("%q => (%d,%v) want (%d,%v)", tc.in, size, ok, tc.size, tc.ok)
 		}

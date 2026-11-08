@@ -158,6 +158,23 @@ This policy applies to parallel Range requests; probe and single-stream
 fallback GETs retain their existing behavior. Backoff is exponential without
 jitter and does not interpret `Retry-After` headers.
 
+### Range response safety
+
+The `bytes=0-0` probe uses response headers without draining the body, so
+an ignored Range or error response cannot stall fallback while streaming
+its body. A `200` selects a fresh single-stream GET. A `416` is accepted
+only with `Content-Range: bytes */0`, which identifies an empty object and
+uses the single-stream path; other probe `416` responses fail `Open`.
+
+Every `206` chunk must declare the exact requested start/end offsets and
+the probed total size in `Content-Range`, as well as supply the expected
+number of bytes. Missing, malformed, or mismatched range headers fail
+without retrying or consuming the response body. Once parallel reading
+starts, a `200` or `416` also fails the reader and cancels sibling requests.
+The stream never restarts or appends those response bodies, even after a
+valid prefix has been delivered. Callers must treat a read error as an
+incomplete download and discard any partial output.
+
 ## Use cases
 
 **Direct fits:** large artifact download; ML / model weights; OCI layer
