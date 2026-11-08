@@ -3,7 +3,6 @@ package downloader
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -32,8 +31,8 @@ func probe(ctx context.Context, client *http.Client, rawURL string, header http.
 		return objectInfo{}, fmt.Errorf("downloader: probe: %w", err)
 	}
 	defer resp.Body.Close()
-	// Drain a little so keep-alive connections can be reused; probe body is tiny.
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	// Inspect only headers. A server ignoring Range may return a large or
+	// never-ending body; draining it would delay fallback (or an error).
 
 	info := objectInfo{
 		Size:         -1,
@@ -43,11 +42,11 @@ func probe(ctx context.Context, client *http.Client, rawURL string, header http.
 
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
-		info.AcceptRanges = true
-		size, ok := parseContentRangeTotal(resp.Header.Get("Content-Range"))
-		if !ok {
+		start, end, size, ok := parseContentRange(resp.Header.Get("Content-Range"))
+		if !ok || start != 0 || end != 0 {
 			return objectInfo{}, fmt.Errorf("downloader: probe: missing or invalid Content-Range on 206")
 		}
+		info.AcceptRanges = true
 		info.Size = size
 		return info, nil
 
@@ -65,39 +64,57 @@ func probe(ctx context.Context, client *http.Client, rawURL string, header http.
 		return info, nil
 
 	case http.StatusRequestedRangeNotSatisfiable:
-		return objectInfo{}, fmt.Errorf("downloader: probe: unexpected 416 on bytes=0-0")
+		// bytes=0-0 is unsatisfiable for an empty object. Only an explicit
+		// unsatisfied range with total zero establishes that case safely.
+		start, end, size, ok := parseContentRange(resp.Header.Get("Content-Range"))
+		if ok && start == -1 && end == -1 && size == 0 {
+			info.Size = 0
+			return info, nil
+		}
+		return objectInfo{}, fmt.Errorf("downloader: probe: unexpected 416 on bytes=0-0: Content-Range %q", resp.Header.Get("Content-Range"))
 
 	default:
 		return objectInfo{}, fmt.Errorf("downloader: probe: unexpected status %s", resp.Status)
 	}
 }
 
-// parseContentRangeTotal parses the total size from a Content-Range header.
-// Examples: "bytes 0-0/12345", "bytes 0-0/*". Returns ok=false for "*".
-func parseContentRangeTotal(h string) (int64, bool) {
-	// RFC 9110: Content-Range = "bytes" SP range-resp
-	// range-resp = incl-range "/" (complete-length / "*")
-	h = strings.TrimSpace(h)
-	if h == "" {
+// parseContentRange parses a single byte range with a known total length.
+// Offsets are inclusive; an unsatisfied range ("bytes */N") has -1 offsets.
+// Unknown totals cannot be used to plan or validate a parallel download.
+func parseContentRange(h string) (start, end, total int64, ok bool) {
+	unit, rest, found := strings.Cut(strings.TrimSpace(h), " ")
+	if !found || !strings.EqualFold(unit, "bytes") {
+		return -1, -1, -1, false
+	}
+	span, length, found := strings.Cut(rest, "/")
+	total, valid := parseRangeNumber(length)
+	if !found || !valid {
+		return -1, -1, -1, false
+	}
+	if span == "*" {
+		return -1, -1, total, true
+	}
+	first, last, found := strings.Cut(span, "-")
+	start, startOK := parseRangeNumber(first)
+	end, endOK := parseRangeNumber(last)
+	if !found || !startOK || !endOK || start > end || end >= total {
+		return -1, -1, -1, false
+	}
+	return start, end, total, true
+}
+
+func parseRangeNumber(s string) (int64, bool) {
+	// The wire grammar is 1*DIGIT; ParseInt alone also accepts a sign.
+	if s == "" {
 		return -1, false
 	}
-	if !strings.HasPrefix(strings.ToLower(h), "bytes ") {
-		return -1, false
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return -1, false
+		}
 	}
-	rest := strings.TrimSpace(h[len("bytes "):])
-	slash := strings.LastIndex(rest, "/")
-	if slash < 0 || slash+1 >= len(rest) {
-		return -1, false
-	}
-	total := rest[slash+1:]
-	if total == "*" {
-		return -1, false
-	}
-	n, err := strconv.ParseInt(total, 10, 64)
-	if err != nil || n < 0 {
-		return -1, false
-	}
-	return n, true
+	n, err := strconv.ParseInt(s, 10, 64)
+	return n, err == nil
 }
 
 func applyHeaders(req *http.Request, header http.Header) {

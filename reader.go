@@ -188,6 +188,11 @@ func (r *parallelReader) doRangeGetOnce(ctx context.Context, br byteRange) ([]by
 
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
+		contentRange := resp.Header.Get("Content-Range")
+		start, end, total, ok := parseContentRange(contentRange)
+		if !ok || start != br.Start || end != br.End-1 || total != r.size {
+			return nil, false, fmt.Errorf("downloader: range [%d-%d): invalid Content-Range %q; want bytes %d-%d/%d", br.Start, br.End, contentRange, br.Start, br.End-1, r.size)
+		}
 		data, err := io.ReadAll(io.LimitReader(resp.Body, want+1))
 		if int64(len(data)) > want {
 			return nil, false, fmt.Errorf("downloader: range [%d-%d): got %d bytes, want %d", br.Start, br.End, len(data), want)
@@ -206,6 +211,11 @@ func (r *parallelReader) doRangeGetOnce(ctx context.Context, br byteRange) ([]by
 	case http.StatusOK:
 		// Server ignored Range — refuse to stitch (correctness invariant #4).
 		return nil, false, fmt.Errorf("downloader: server returned 200 for Range [%d-%d); refusing to stitch", br.Start, br.End)
+
+	case http.StatusRequestedRangeNotSatisfiable:
+		// A range planned from the probe must remain satisfiable. Do not
+		// reinterpret this as EOF or restart after bytes may be delivered.
+		return nil, false, fmt.Errorf("downloader: server returned 416 for Range [%d-%d): Content-Range %q; refusing to stitch", br.Start, br.End, resp.Header.Get("Content-Range"))
 
 	default:
 		// Close rather than drain error bodies: they may be large or stalled.
