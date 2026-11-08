@@ -33,7 +33,7 @@ Add new items at the end of the matching section as ideas appear.
 
 - [x] ~~Per-chunk retries with backoff / timeouts~~
 - [x] ~~Handle `416` and `200`-on-`Range` safely (no mismatched stitch)~~
-- [ ] Memory / prefetch caps (`PrefetchWindow`, `BufferMemoryLimit`)
+- [x] ~~Memory / prefetch caps (`PrefetchWindow`, `BufferMemoryLimit`)~~
 - [ ] Progress hook (`WithProgress`)
 - [x] ~~Small-file fast path (below parallel threshold → single GET)~~
 - [ ] ETag / size consistency checks mid-download
