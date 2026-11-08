@@ -1,7 +1,7 @@
 // Package downloader provides a high-performance HTTP downloader that
 // exposes a sequential io.Reader while prefetching byte ranges in parallel.
 //
-// See DESIGN.md for architecture, use cases, and the implementation roadmap.
+// See README.md for architecture and TRACKING.md for the implementation backlog.
 package downloader
 
 import (
@@ -164,7 +164,7 @@ func Open(ctx context.Context, url string, opts ...Option) (Reader, error) {
 
 	// Phase 1: probe → plan → fetch → ordered Read.
 	_ = cfg
-	return nil, fmt.Errorf("downloader: Open not implemented yet; see DESIGN.md")
+	return nil, fmt.Errorf("downloader: Open not implemented yet; see TRACKING.md")
 }
 
 func validateConfig(c *Config) error {
