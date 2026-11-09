@@ -37,7 +37,7 @@ Add new items at the end of the matching section as ideas appear.
 - [x] ~~Progress hook (`WithProgress`)~~
 - [x] ~~Small-file fast path (below parallel threshold → single GET)~~
 - [x] ~~ETag / size consistency checks mid-download~~
-- [ ] Bit-identical correctness tests vs single-stream download
+- [x] ~~Bit-identical correctness tests vs single-stream download~~
 
 ## Light adaptations
 
