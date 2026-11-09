@@ -1,0 +1,4 @@
+github.com/klauspost/compress v1.20.3 h1:zWNoFqq/lSuYQRim3dUXlXeA0IqwuZGicdG5ZTfY5j4=
+github.com/klauspost/compress v1.20.3/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
+github.com/yolocs/go-downloader v0.0.0-20261109062148-81ee1274dd69 h1:71bGQnCSdRX6H57ZB+huX7UW/KQ6B1MZj+/D3X6vr8o=
+github.com/yolocs/go-downloader v0.0.0-20261109062148-81ee1274dd69/go.mod h1:lZaRbVFagFYZxZWkintgTuUgE71t+xwvFxyYV1C+TUs=

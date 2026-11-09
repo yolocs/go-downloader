@@ -41,7 +41,7 @@ Add new items at the end of the matching section as ideas appear.
 
 ## Light adaptations
 
-- [ ] Streaming decompress / extract examples (`gzip` / `zstd` / `tar`)
+- [x] ~~Streaming decompress / extract examples (`gzip` / `zstd` / `tar`)~~
 - [ ] Integrity: final stream hash (e.g. SHA-256) before rename-into-place
 - [ ] Integrity: optional per-chunk checksums
 - [ ] Resumable downloads (`WithResume` / persisted chunk map)
