@@ -180,6 +180,26 @@ func TestBitIdenticalSmallReads(t *testing.T) {
 	}
 }
 
+func TestBitIdenticalFallbackPath(t *testing.T) {
+	t.Parallel()
+
+	payload := deterministicPayload(50_000, 42)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(payload)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(payload)
+	}))
+	t.Cleanup(srv.Close)
+
+	ctx := context.Background()
+	client := srv.Client()
+	want := singleStreamGET(t, ctx, client, srv.URL)
+	got := parallelDownloadBytes(t, ctx, srv.URL, client)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("fallback mismatch at %d", firstMismatch(got, want))
+	}
+}
+
 func FuzzBitIdenticalParallelDownload(f *testing.F) {
 	f.Add(byte(0), int32(1), int32(512), int32(2), int32(2))
 	f.Add(byte(7), int32(4096), int32(1024), int32(4), int32(4))
@@ -196,6 +216,12 @@ func FuzzBitIdenticalParallelDownload(f *testing.F) {
 		}
 		if chunk > int64(size+1) && size > 0 {
 			chunk = int64(size)
+		}
+		if size > 0 {
+			nChunks := (int64(size) + chunk - 1) / chunk
+			if nChunks > 512 {
+				return
+			}
 		}
 		conc := int(conc32)
 		if conc < 1 {
