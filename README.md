@@ -289,6 +289,17 @@ go test ./...
 go test -bench=. -benchmem ./...
 ```
 
+### Examples
+
+Runnable programs under [examples/](examples/) show streaming
+decompress and extract on top of the parallel `Reader`:
+
+| Example | Pipeline |
+| --- | --- |
+| [decompress-gzip](examples/decompress-gzip/) | download → `gzip.Reader` → file or stdout |
+| [extract-targz](examples/extract-targz/) | download → gzip → `tar.Reader` → directory |
+| [decompress-zstd](examples/decompress-zstd/) | download → `zstd.Reader` → file or stdout |
+
 Feature tracking: [TRACKING.md](TRACKING.md).
 
 ## License

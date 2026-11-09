@@ -19,3 +19,8 @@ jobs:
         run: go test ./...
       - name: Format check
         run: test -z "$(gofmt -l .)"
+      - name: Build examples
+        run: |
+          go build -o /dev/null ./examples/decompress-gzip/
+          go build -o /dev/null ./examples/extract-targz/
+          (cd examples/decompress-zstd && go build -o /dev/null .)
