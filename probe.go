@@ -124,3 +124,44 @@ func applyHeaders(req *http.Request, header http.Header) {
 		}
 	}
 }
+
+// applyObjectValidators pins the download to the probed representation.
+// Prefer ETag (If-Match); fall back to Last-Modified when no ETag is present.
+func applyObjectValidators(req *http.Request, etag, lastModified string) {
+	if etag != "" {
+		req.Header.Set("If-Match", etag)
+		return
+	}
+	if lastModified != "" {
+		req.Header.Set("If-Unmodified-Since", lastModified)
+	}
+}
+
+// checkETagConsistency fails when both the probed and response ETags are
+// present and disagree. A missing response ETag is tolerated — some origins
+// omit it on Range responses while still honoring If-Match.
+func checkETagConsistency(probed, got string) error {
+	probed = strings.TrimSpace(probed)
+	got = strings.TrimSpace(got)
+	if probed == "" || got == "" || probed == got {
+		return nil
+	}
+	return fmt.Errorf("%w: ETag %q != probed %q", ErrObjectChanged, got, probed)
+}
+
+// checkContentLength fails when a Content-Length header is present and does
+// not match the expected byte count. An omitted header is allowed.
+func checkContentLength(header string, want int64) error {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return nil
+	}
+	n, err := strconv.ParseInt(header, 10, 64)
+	if err != nil {
+		return fmt.Errorf("bad Content-Length %q: %w", header, err)
+	}
+	if n != want {
+		return fmt.Errorf("Content-Length %d != expected %d", n, want)
+	}
+	return nil
+}

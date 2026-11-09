@@ -36,7 +36,7 @@ Add new items at the end of the matching section as ideas appear.
 - [x] ~~Memory / prefetch caps (`PrefetchWindow`, `BufferMemoryLimit`)~~
 - [x] ~~Progress hook (`WithProgress`)~~
 - [x] ~~Small-file fast path (below parallel threshold → single GET)~~
-- [ ] ETag / size consistency checks mid-download
+- [x] ~~ETag / size consistency checks mid-download~~
 - [ ] Bit-identical correctness tests vs single-stream download
 
 ## Light adaptations

@@ -99,6 +99,7 @@ their streaming behavior and do not use the parallel buffer budget.
 
 - Transient HTTP/network errors: retry with backoff (per chunk).
 - Permanent 4xx (except 416 handled carefully): fail the Reader.
+- Object mutation mid-download (ETag/size/`412`): `ErrObjectChanged`.
 - Surface the first fatal error on the next `Read` (standard Go stream
   pattern); optional `Err()` for early inspection.
 - Context cancel / `Close`: stop cleanly; subsequent `Read` returns
@@ -119,6 +120,8 @@ Package: `github.com/yolocs/go-downloader`.
 
 ```go
 func Open(ctx context.Context, url string, opts ...Option) (Reader, error)
+
+var ErrObjectChanged = errors.New("downloader: remote object changed during download")
 
 type Reader interface {
     io.ReadCloser
@@ -175,10 +178,10 @@ they must stay non-blocking and must not call methods on that reader.
 Parallel chunks retry HTTP 408, 429, 500, 502, 503, and 504 responses,
 transient network failures, truncated bodies, and attempt timeouts. Each
 attempt restarts the same range; partial bytes from a failed attempt are
-discarded. Other statuses (including `200` on Range and `416`) fail
-immediately. An exhausted or permanent failure cancels other workers and
-is returned by `Read`, with underlying errors preserved for `errors.Is`
-and `errors.As`.
+discarded. Other statuses (including `200` on Range, `412`, and `416`)
+fail immediately. An exhausted or permanent failure cancels other workers
+and is returned by `Read`, with underlying errors preserved for
+`errors.Is` and `errors.As`.
 
 ```go
 r, err := downloader.Open(ctx, url,
@@ -218,6 +221,20 @@ The stream never restarts or appends those response bodies, even after a
 valid prefix has been delivered. Callers must treat a read error as an
 incomplete download and discard any partial output.
 
+### Object consistency
+
+The probe captures `ETag` and `Last-Modified` when present. Parallel Range
+requests and the single-stream fallback pin that representation with
+`If-Match` (preferred) or `If-Unmodified-Since`. A `412` response surfaces
+as `ErrObjectChanged`.
+
+When a `206` (or fallback `200`) also returns an ETag, it must match the
+probed value; a differing ETag is `ErrObjectChanged`. Origins that omit
+ETag on Range responses are accepted if validators still hold. A
+`Content-Range` total that disagrees with the probed size, or a fallback
+`Content-Length` that disagrees with the probed size, is likewise
+`ErrObjectChanged`. Callers should discard partial output and restart.
+
 ## Use cases
 
 **Direct fits:** large artifact download; ML / model weights; OCI layer
@@ -252,7 +269,6 @@ multi-source / P2P-adjacent designs.
 | CPU vs network | Large concurrency can hurt on localhost / saturated NICs |
 | Memory pressure | Hard limits essential when consumer is slow |
 | HEAD support | Some CDNs dislike HEAD; prefer ranged probe |
-| ETag changes mid-download | Detect mismatch; fail rather than corrupt |
 | Eager vs lazy prefetch start | Eager hides latency; lazy avoids work if unused |
 | API name | `Open` vs `NewReader` vs `Get` — lean `Open` / `NewReader` |
 
