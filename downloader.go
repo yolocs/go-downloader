@@ -6,12 +6,18 @@ package downloader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"time"
 )
+
+// ErrObjectChanged is returned when a mid-download response indicates the
+// remote object no longer matches the probe (ETag or size). Callers should
+// discard any partial output and restart the download if desired.
+var ErrObjectChanged = errors.New("downloader: remote object changed during download")
 
 // Default tuning knobs. Safe starting points; override via Option.
 const (
@@ -197,7 +203,7 @@ func Open(ctx context.Context, url string, opts ...Option) (Reader, error) {
 
 	useParallel := info.AcceptRanges && info.Size > 0 && info.Size >= cfg.ParallelThreshold
 	if !useParallel {
-		return openFallback(ctx, cfg, url, info.Size)
+		return openFallback(ctx, cfg, url, info)
 	}
 	return openParallelReader(ctx, cfg, url, info)
 }

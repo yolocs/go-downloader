@@ -8,17 +8,19 @@ import (
 	"io/fs"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 )
 
 // parallelReader implements Reader by prefetching fixed-size Range GETs
 // into an ordered reorder buffer.
 type parallelReader struct {
-	cfg    Config
-	url    string
-	size   int64
-	etag   string
-	ranges []byteRange
+	cfg          Config
+	url          string
+	size         int64
+	etag         string
+	lastModified string
+	ranges       []byteRange
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -46,14 +48,15 @@ func openParallelReader(ctx context.Context, cfg Config, rawURL string, info obj
 
 	ctx, cancel := context.WithCancel(ctx)
 	r := &parallelReader{
-		cfg:    cfg,
-		url:    rawURL,
-		size:   info.Size,
-		etag:   info.ETag,
-		ranges: ranges,
-		ctx:    ctx,
-		cancel: cancel,
-		slots:  make([][]byte, len(ranges)),
+		cfg:          cfg,
+		url:          rawURL,
+		size:         info.Size,
+		etag:         info.ETag,
+		lastModified: info.LastModified,
+		ranges:       ranges,
+		ctx:          ctx,
+		cancel:       cancel,
+		slots:        make([][]byte, len(ranges)),
 	}
 	r.cond = sync.NewCond(&r.mu)
 
@@ -206,9 +209,7 @@ func (r *parallelReader) doRangeGetOnce(ctx context.Context, br byteRange, data 
 	}
 	applyHeaders(req, r.cfg.Header)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", br.Start, br.End-1))
-	if r.etag != "" {
-		req.Header.Set("If-Match", r.etag)
-	}
+	applyObjectValidators(req, r.etag, r.lastModified)
 
 	resp, err := r.cfg.HTTPClient.Do(req)
 	if err != nil {
@@ -223,8 +224,18 @@ func (r *parallelReader) doRangeGetOnce(ctx context.Context, br byteRange, data 
 	case http.StatusPartialContent:
 		contentRange := resp.Header.Get("Content-Range")
 		start, end, total, ok := parseContentRange(contentRange)
-		if !ok || start != br.Start || end != br.End-1 || total != r.size {
+		if !ok || start != br.Start || end != br.End-1 {
 			return nil, false, fmt.Errorf("downloader: range [%d-%d): invalid Content-Range %q; want bytes %d-%d/%d", br.Start, br.End, contentRange, br.Start, br.End-1, r.size)
+		}
+		if total != r.size {
+			// Offsets match the request but the object length changed.
+			return nil, false, fmt.Errorf("%w: Content-Range total %d != probed size %d", ErrObjectChanged, total, r.size)
+		}
+		if err := checkETagConsistency(r.etag, resp.Header.Get("ETag")); err != nil {
+			return nil, false, fmt.Errorf("downloader: range [%d-%d): %w", br.Start, br.End, err)
+		}
+		if err := checkContentLength(resp.Header.Get("Content-Length"), want); err != nil {
+			return nil, false, fmt.Errorf("downloader: range [%d-%d): %w", br.Start, br.End, err)
 		}
 		var n int
 		var readErr error
@@ -273,6 +284,10 @@ func (r *parallelReader) doRangeGetOnce(ctx context.Context, br byteRange, data 
 		// reinterpret this as EOF or restart after bytes may be delivered.
 		return nil, false, fmt.Errorf("downloader: server returned 416 for Range [%d-%d): Content-Range %q; refusing to stitch", br.Start, br.End, resp.Header.Get("Content-Range"))
 
+	case http.StatusPreconditionFailed:
+		// If-Match / If-Unmodified-Since rejected: object changed since probe.
+		return nil, false, fmt.Errorf("%w: range [%d-%d): status %s", ErrObjectChanged, br.Start, br.End, resp.Status)
+
 	default:
 		// Close rather than drain error bodies: they may be large or stalled.
 		return nil, retryableStatus(resp.StatusCode), fmt.Errorf("downloader: range GET [%d-%d): status %s", br.Start, br.End, resp.Status)
@@ -290,7 +305,7 @@ type fallbackReader struct {
 	closed     bool
 }
 
-func openFallback(ctx context.Context, cfg Config, rawURL string, size int64) (*fallbackReader, error) {
+func openFallback(ctx context.Context, cfg Config, rawURL string, info objectInfo) (*fallbackReader, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -298,24 +313,55 @@ func openFallback(ctx context.Context, cfg Config, rawURL string, size int64) (*
 		return nil, fmt.Errorf("downloader: fallback request: %w", err)
 	}
 	applyHeaders(req, cfg.Header)
+	applyObjectValidators(req, info.ETag, info.LastModified)
 
 	resp, err := cfg.HTTPClient.Do(req)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("downloader: fallback GET: %w", err)
 	}
+	if resp.StatusCode == http.StatusPreconditionFailed {
+		resp.Body.Close()
+		cancel()
+		return nil, fmt.Errorf("%w: fallback GET: status %s", ErrObjectChanged, resp.Status)
+	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
 		cancel()
 		return nil, fmt.Errorf("downloader: fallback GET: status %s", resp.Status)
 	}
+
+	size := info.Size
+	contentLength := resp.Header.Get("Content-Length")
 	if size < 0 {
-		if cl := resp.Header.Get("Content-Length"); cl != "" {
-			if n, err := strconv.ParseInt(cl, 10, 64); err == nil {
-				size = n
+		if contentLength != "" {
+			n, err := strconv.ParseInt(contentLength, 10, 64)
+			if err != nil {
+				resp.Body.Close()
+				cancel()
+				return nil, fmt.Errorf("downloader: fallback GET: bad Content-Length %q: %w", contentLength, err)
 			}
+			size = n
+		}
+	} else if contentLength != "" {
+		n, err := strconv.ParseInt(strings.TrimSpace(contentLength), 10, 64)
+		if err != nil {
+			resp.Body.Close()
+			cancel()
+			return nil, fmt.Errorf("downloader: fallback GET: bad Content-Length %q: %w", contentLength, err)
+		}
+		if n != size {
+			resp.Body.Close()
+			cancel()
+			return nil, fmt.Errorf("%w: Content-Length %d != probed size %d", ErrObjectChanged, n, size)
 		}
 	}
+	if err := checkETagConsistency(info.ETag, resp.Header.Get("ETag")); err != nil {
+		resp.Body.Close()
+		cancel()
+		return nil, fmt.Errorf("downloader: fallback GET: %w", err)
+	}
+
 	return &fallbackReader{
 		body:       resp.Body,
 		size:       size,
