@@ -137,6 +137,11 @@ func WithHeader(key, value string) Option
 func WithRetry(policy RetryPolicy) Option
 func WithBufferMemoryLimit(n int64) Option
 func WithProgress(fn func(Progress)) Option
+
+func SaveFile(ctx context.Context, url, path string, expectedSHA256 []byte, opts ...Option) error
+func ParseSHA256Hex(s string) ([]byte, error)
+
+var ErrDigestMismatch = errors.New("downloader: SHA-256 digest mismatch")
 ```
 
 ### Suggested defaults
@@ -299,6 +304,30 @@ decompress and extract on top of the parallel `Reader`:
 | [decompress-gzip](examples/decompress-gzip/) | download → `gzip.Reader` → file or stdout |
 | [extract-targz](examples/extract-targz/) | download → gzip → `tar.Reader` → directory |
 | [decompress-zstd](examples/decompress-zstd/) | download → `zstd.Reader` → file or stdout |
+
+### Integrity (atomic file save)
+
+`SaveFile` downloads to a sibling temporary file, hashes the stream with
+SHA-256 while writing, and renames into place only when the digest matches.
+A mismatch or other failure removes the temporary file and leaves the
+destination path unchanged.
+
+```go
+expected, err := downloader.ParseSHA256Hex("a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3")
+if err != nil {
+    return err
+}
+err = downloader.SaveFile(ctx, url, "/var/data/artifact.bin", expected,
+    downloader.WithConcurrency(8),
+)
+if errors.Is(err, downloader.ErrDigestMismatch) {
+    // discard and retry or fetch a new digest
+}
+```
+
+Pass the same `Option` values as `Open` (client, concurrency, retries, and
+so on). `expected` must be exactly 32 bytes; use `ParseSHA256Hex` for
+hex-encoded release checksums.
 
 Feature tracking: [TRACKING.md](TRACKING.md).
 
