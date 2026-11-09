@@ -31,6 +31,8 @@ type parallelReader struct {
 	reservedBytes int64    // active, queued, and current chunk payloads
 	slots         [][]byte // indexed by chunk; nil = not ready
 	buf           []byte   // remainder of the chunk currently being read
+	bytesRead     int64
+	bytesFetched  int64
 	err           error
 	closed        bool
 	wg            sync.WaitGroup
@@ -78,6 +80,7 @@ func (r *parallelReader) Read(p []byte) (int, error) {
 		if len(r.buf) > 0 {
 			n := copy(p, r.buf)
 			r.buf = r.buf[n:]
+			r.bytesRead += int64(n)
 			if len(r.buf) == 0 {
 				// Slicing off a prefix retains the whole backing allocation.
 				// Release its reservation only after the chunk is fully read.
@@ -87,6 +90,7 @@ func (r *parallelReader) Read(p []byte) (int, error) {
 				r.nextToDeliver++
 				r.scheduleLocked()
 			}
+			r.emitProgressLocked()
 			return n, nil
 		}
 		if r.nextToDeliver >= len(r.ranges) {
@@ -174,8 +178,24 @@ func (r *parallelReader) fetch(idx int) {
 		return
 	}
 	r.slots[idx] = data
+	r.bytesFetched += int64(len(data))
 	r.scheduleLocked()
+	r.emitProgressLocked()
 	r.cond.Broadcast()
+}
+
+// emitProgressLocked invokes OnProgress with the current counters.
+// Caller must hold r.mu. The callback must not re-enter the Reader.
+func (r *parallelReader) emitProgressLocked() {
+	fn := r.cfg.OnProgress
+	if fn == nil || r.closed {
+		return
+	}
+	fn(Progress{
+		BytesRead:    r.bytesRead,
+		BytesFetched: r.bytesFetched,
+		Total:        r.size,
+	})
 }
 
 func (r *parallelReader) doRangeGetOnce(ctx context.Context, br byteRange, data []byte) ([]byte, bool, error) {
@@ -261,11 +281,13 @@ func (r *parallelReader) doRangeGetOnce(ctx context.Context, br byteRange, data 
 
 // fallbackReader wraps a single streaming GET body.
 type fallbackReader struct {
-	body   io.ReadCloser
-	size   int64
-	cancel context.CancelFunc
-	closed bool
-	mu     sync.Mutex
+	body       io.ReadCloser
+	size       int64
+	onProgress func(Progress)
+	cancel     context.CancelFunc
+	mu         sync.Mutex
+	bytesRead  int64
+	closed     bool
 }
 
 func openFallback(ctx context.Context, cfg Config, rawURL string, size int64) (*fallbackReader, error) {
@@ -294,19 +316,46 @@ func openFallback(ctx context.Context, cfg Config, rawURL string, size int64) (*
 			}
 		}
 	}
-	return &fallbackReader{body: resp.Body, size: size, cancel: cancel}, nil
+	return &fallbackReader{
+		body:       resp.Body,
+		size:       size,
+		onProgress: cfg.OnProgress,
+		cancel:     cancel,
+	}, nil
 }
 
 func (r *fallbackReader) Size() int64 { return r.size }
 
 func (r *fallbackReader) Read(p []byte) (int, error) {
 	r.mu.Lock()
-	closed := r.closed
-	r.mu.Unlock()
-	if closed {
+	if r.closed {
+		r.mu.Unlock()
 		return 0, fs.ErrClosed
 	}
-	return r.body.Read(p)
+	r.mu.Unlock()
+
+	n, err := r.body.Read(p)
+	if n > 0 {
+		r.mu.Lock()
+		r.bytesRead += int64(n)
+		r.emitProgressLocked()
+		r.mu.Unlock()
+	}
+	return n, err
+}
+
+// emitProgressLocked invokes OnProgress. Caller must hold r.mu.
+func (r *fallbackReader) emitProgressLocked() {
+	fn := r.onProgress
+	if fn == nil || r.closed {
+		return
+	}
+	// Single-stream path has no reorder buffer; fetched tracks read.
+	fn(Progress{
+		BytesRead:    r.bytesRead,
+		BytesFetched: r.bytesRead,
+		Total:        r.size,
+	})
 }
 
 func (r *fallbackReader) Close() error {

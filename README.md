@@ -150,6 +150,26 @@ func WithProgress(fn func(Progress)) Option
 
 Defaults stay boring and safe; throughput tuning is opt-in.
 
+### Progress
+
+`WithProgress` reports how far the download has advanced:
+
+```go
+r, err := downloader.Open(ctx, url,
+    downloader.WithProgress(func(p downloader.Progress) {
+        fmt.Printf("%d / %d read (%d fetched)\n", p.BytesRead, p.Total, p.BytesFetched)
+    }),
+)
+```
+
+`BytesRead` counts bytes delivered through `Read`. `BytesFetched` counts
+bytes that have landed in the reorder buffer and may lead `BytesRead` on
+the parallel path; on the single-stream fallback the two stay equal.
+`Total` is Content-Length when known, otherwise `-1`.
+
+Callbacks are serialized per reader and run under the reader's lock, so
+they must stay non-blocking and must not call methods on that reader.
+
 ### Chunk retries and timeouts
 
 Parallel chunks retry HTTP 408, 429, 500, 502, 503, and 504 responses,
