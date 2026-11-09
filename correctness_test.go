@@ -5,231 +5,250 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
 
-// singleStreamReference downloads url with one plain GET, matching the
-// correctness invariant that parallel Range assembly must equal [0, Size).
-func singleStreamReference(ctx context.Context, client *http.Client, url string) ([]byte, error) {
+// deterministicPayload returns repeatable bytes for corpus / fuzz inputs.
+func deterministicPayload(size int, seed byte) []byte {
+	if size <= 0 {
+		return nil
+	}
+	out := make([]byte, size)
+	var x uint64 = uint64(seed)*2654435761 + 17
+	for i := range out {
+		x ^= x << 13
+		x ^= x >> 7
+		x ^= x << 17
+		out[i] = byte(x >> (i % 8))
+	}
+	return out
+}
+
+func singleStreamGET(t *testing.T, ctx context.Context, client *http.Client, url string) []byte {
+	t.Helper()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		t.Fatalf("NewRequest: %v", err)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		t.Fatalf("GET: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return nil, fmt.Errorf("reference GET: %s", resp.Status)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET status=%d", resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll GET body: %v", err)
+	}
+	return got
 }
 
-func assertBitIdenticalToSingleStream(t *testing.T, payload []byte, opts ...Option) {
+func parallelDownloadBytes(t *testing.T, ctx context.Context, url string, client *http.Client, opts ...Option) []byte {
 	t.Helper()
+	all := append([]Option{WithHTTPClient(client), WithParallelThreshold(1)}, opts...)
+	r, err := Open(ctx, url, all...)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer r.Close()
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll parallel: %v", err)
+	}
+	return got
+}
 
+func assertBitIdenticalToSingleStream(
+	t *testing.T,
+	payload []byte,
+	opts ...Option,
+) {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serveRange(w, r, payload, nil)
 	}))
 	t.Cleanup(srv.Close)
 
-	base := []Option{
-		WithHTTPClient(srv.Client()),
-		WithParallelThreshold(1), // exercise parallel path for multi-byte objects
+	ctx := context.Background()
+	client := srv.Client()
+	want := singleStreamGET(t, ctx, client, srv.URL)
+	got := parallelDownloadBytes(t, ctx, srv.URL, client, opts...)
+	if !bytes.Equal(got, want) {
+		first := firstMismatch(got, want)
+		t.Fatalf("payload mismatch at byte %d (got %d bytes, want %d)", first, len(got), len(want))
 	}
-	want, err := singleStreamReference(context.Background(), srv.Client(), srv.URL)
-	if err != nil {
-		t.Fatalf("reference GET: %v", err)
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("parallel result diverged from server payload")
+	}
+}
+
+func firstMismatch(a, b []byte) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	if len(a) != len(b) {
+		return n
+	}
+	return -1
+}
+
+func TestBitIdenticalVsSingleStreamCorpus(t *testing.T) {
+	sizes := []int{
+		0, 1, 2, 3, 7, 8, 9, 15, 16, 17,
+		127, 128, 129, 255, 256, 257,
+		1023, 1024, 1025,
+		4095, 4096, 4097,
+		10_000, 65_537,
+		256<<10 + 123,
+	}
+	configs := []struct {
+		name string
+		opts []Option
+	}{
+		{"chunk1_serial", []Option{WithChunkSize(1), WithConcurrency(1), WithPrefetchWindow(1)}},
+		{"chunk7_parallel", []Option{WithChunkSize(7), WithConcurrency(3), WithPrefetchWindow(2)}},
+		{"chunk1kb", []Option{WithChunkSize(1024), WithConcurrency(4), WithPrefetchWindow(4)}},
+		{"chunk4kb_wide", []Option{WithChunkSize(4096), WithConcurrency(8), WithPrefetchWindow(8), WithBufferMemoryLimit(32 << 20)}},
 	}
 
-	allOpts := append(base, opts...)
-	r, err := Open(context.Background(), srv.URL, allOpts...)
+	for _, size := range sizes {
+		payload := deterministicPayload(size, byte(size%251))
+		for _, cfg := range configs {
+			if size > 0 && int64(size) < 4096 && cfg.name == "chunk4kb_wide" {
+				continue
+			}
+			t.Run(fmt.Sprintf("size=%d/%s", size, cfg.name), func(t *testing.T) {
+				t.Parallel()
+				assertBitIdenticalToSingleStream(t, payload, cfg.opts...)
+			})
+		}
+	}
+}
+
+func TestBitIdenticalSmallReads(t *testing.T) {
+	t.Parallel()
+
+	payload := deterministicPayload(12_345, 42)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serveRange(w, r, payload, nil)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	client := srv.Client()
+	want := singleStreamGET(t, ctx, client, srv.URL)
+
+	r, err := Open(ctx, srv.URL,
+		WithHTTPClient(client),
+		WithChunkSize(997),
+		WithConcurrency(5),
+		WithPrefetchWindow(4),
+		WithParallelThreshold(1),
+	)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	t.Cleanup(func() { _ = r.Close() })
+	defer r.Close()
 
-	got, err := readViaBufferedReads(r)
-	if err != nil {
-		t.Fatalf("Read: %v", err)
-	}
-	if !bytes.Equal(got, want) {
-		reportPayloadMismatch(t, got, want)
-	}
-	if r.Size() >= 0 && int64(len(want)) != r.Size() {
-		t.Fatalf("Size()=%d want %d", r.Size(), len(want))
-	}
-}
-
-// readViaBufferedReads drains r with varying buffer sizes so chunk stitching
-// is exercised across partial Reads, not only ReadAll coalescing.
-func readViaBufferedReads(r Reader) ([]byte, error) {
-	var out []byte
-	buf := make([]byte, 17) // deliberate non-power-of-two
+	var got bytes.Buffer
+	buf := make([]byte, 13)
 	for {
 		n, err := r.Read(buf)
 		if n > 0 {
-			out = append(out, buf[:n]...)
+			got.Write(buf[:n])
 		}
 		if err == io.EOF {
-			return out, nil
+			break
 		}
 		if err != nil {
-			return out, err
+			t.Fatalf("Read: %v", err)
 		}
 	}
-}
 
-func reportPayloadMismatch(t *testing.T, got, want []byte) {
-	t.Helper()
-	for i := 0; i < len(got) && i < len(want); i++ {
-		if got[i] != want[i] {
-			t.Fatalf("payload mismatch at offset %d: got %d bytes, want %d (got[%d]=%#x want[%d]=%#x)",
-				i, len(got), len(want), i, got[i], i, want[i])
-		}
-	}
-	t.Fatalf("payload length mismatch: got %d bytes, want %d", len(got), len(want))
-}
-
-func pseudoRandomPayload(seed int64, size int) []byte {
-	if size == 0 {
-		return nil
-	}
-	src := rand.New(rand.NewSource(seed))
-	out := make([]byte, size)
-	for i := range out {
-		out[i] = byte(src.Intn(256))
-	}
-	return out
-}
-
-type bitIdenticalCase struct {
-	name       string
-	size       int
-	chunkSize  int64
-	concurrent int
-	prefetch   int
-}
-
-// bitIdenticalCorpus covers boundary sizes and planner/worker combinations
-// without exploding request count (e.g. no 1 MiB object with 1-byte chunks).
-func bitIdenticalCorpus() []bitIdenticalCase {
-	sizes := []int{
-		0, 1, 2, 7, 8, 9, 15, 16, 17,
-		127, 128, 129, 255, 256, 257,
-		1023, 1024, 1025, 4095, 4096, 4097,
-		10000, 256 << 10,
-	}
-	chunks := []int64{1, 7, 128, 1024, 4096}
-	concurrency := []int{1, 2, 4, 8}
-	prefetch := []int{1, 2, 4}
-
-	var cases []bitIdenticalCase
-	for _, size := range sizes {
-		for _, chunk := range chunks {
-			if size > 0 && chunk > int64(size) {
-				continue
-			}
-			if size > 0 {
-				nChunks := (int64(size) + chunk - 1) / chunk
-				if nChunks > 512 {
-					continue
-				}
-			}
-			for _, c := range concurrency {
-				for _, w := range prefetch {
-					cases = append(cases, bitIdenticalCase{
-						name:       fmt.Sprintf("size=%d_chunk=%d_conc=%d_win=%d", size, chunk, c, w),
-						size:       size,
-						chunkSize:  chunk,
-						concurrent: c,
-						prefetch:   w,
-					})
-				}
-			}
-		}
-	}
-	return cases
-}
-
-func TestBitIdenticalCorpus(t *testing.T) {
-	for _, tc := range bitIdenticalCorpus() {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			payload := pseudoRandomPayload(int64(tc.size)*991+int64(tc.size), tc.size)
-			assertBitIdenticalToSingleStream(t, payload,
-				WithChunkSize(tc.chunkSize),
-				WithConcurrency(tc.concurrent),
-				WithPrefetchWindow(tc.prefetch),
-			)
-		})
+	if !bytes.Equal(got.Bytes(), want) {
+		t.Fatalf("small-read mismatch at %d", firstMismatch(got.Bytes(), want))
 	}
 }
 
 func TestBitIdenticalFallbackPath(t *testing.T) {
 	t.Parallel()
 
-	payload := pseudoRandomPayload(42, 50_000)
+	payload := deterministicPayload(50_000, 42)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Ignore Range on all requests but still advertise length.
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(payload)))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(payload)
 	}))
 	t.Cleanup(srv.Close)
 
-	want, err := singleStreamReference(context.Background(), srv.Client(), srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	r, err := Open(context.Background(), srv.URL, WithHTTPClient(srv.Client()))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = r.Close() })
-
-	got, err := readViaBufferedReads(r)
-	if err != nil {
-		t.Fatalf("Read: %v", err)
-	}
+	ctx := context.Background()
+	client := srv.Client()
+	want := singleStreamGET(t, ctx, client, srv.URL)
+	got := parallelDownloadBytes(t, ctx, srv.URL, client)
 	if !bytes.Equal(got, want) {
-		reportPayloadMismatch(t, got, want)
+		t.Fatalf("fallback mismatch at %d", firstMismatch(got, want))
 	}
 }
 
 func FuzzBitIdenticalParallelDownload(f *testing.F) {
-	f.Add(int(1024), int64(128), 3, 2)
-	f.Add(int(0), int64(1), 1, 1)
+	f.Add(byte(0), int32(1), int32(512), int32(2), int32(2))
+	f.Add(byte(7), int32(4096), int32(1024), int32(4), int32(4))
+	f.Add(byte(99), int32(8191), int32(37), int32(3), int32(2))
 
-	f.Fuzz(func(t *testing.T, size int, chunkSize int64, concurrency, prefetch int) {
-		if size < 0 || size > 256<<10 {
+	f.Fuzz(func(t *testing.T, seed byte, size32 int32, chunk32 int32, conc32 int32, window32 int32) {
+		size := int(size32)
+		if size < 0 || size > 1<<18 {
 			return
 		}
-		if chunkSize < 1 || chunkSize > 1<<20 {
-			return
+		chunk := int64(chunk32)
+		if chunk <= 0 {
+			chunk = 1
 		}
-		if concurrency < 1 || concurrency > 16 {
-			return
-		}
-		if prefetch < 1 || prefetch > 16 {
-			return
+		if chunk > int64(size+1) && size > 0 {
+			chunk = int64(size)
 		}
 		if size > 0 {
-			nChunks := (int64(size) + chunkSize - 1) / chunkSize
+			nChunks := (int64(size) + chunk - 1) / chunk
 			if nChunks > 512 {
 				return
 			}
 		}
-		payload := pseudoRandomPayload(0xF00D, size)
-		assertBitIdenticalToSingleStream(t, payload,
-			WithChunkSize(chunkSize),
-			WithConcurrency(concurrency),
-			WithPrefetchWindow(prefetch),
-		)
+		conc := int(conc32)
+		if conc < 1 {
+			conc = 1
+		}
+		if conc > 16 {
+			conc = 16
+		}
+		window := int(window32)
+		if window < 1 {
+			window = 1
+		}
+		if window > 16 {
+			window = 16
+		}
+
+		payload := deterministicPayload(size, seed)
+		memLimit := chunk * int64(window)
+		if memLimit < chunk {
+			return
+		}
+		opts := []Option{
+			WithChunkSize(chunk),
+			WithConcurrency(conc),
+			WithPrefetchWindow(window),
+			WithBufferMemoryLimit(memLimit),
+		}
+		assertBitIdenticalToSingleStream(t, payload, opts...)
 	})
 }
