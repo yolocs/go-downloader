@@ -35,7 +35,8 @@ type Progress struct {
 	// BytesRead is the number of bytes consumed via Read so far.
 	BytesRead int64
 	// BytesFetched is the number of bytes successfully downloaded into
-	// the reorder buffer (may be ahead of BytesRead).
+	// the reorder buffer. On the parallel path this may be ahead of
+	// BytesRead; on the single-stream fallback it equals BytesRead.
 	BytesFetched int64
 	// Total is Content-Length when known, or -1.
 	Total int64
@@ -133,7 +134,11 @@ func WithBufferMemoryLimit(n int64) Option {
 }
 
 // WithProgress registers a callback invoked as the download advances.
-// The callback must be non-blocking; it may run on fetcher goroutines.
+//
+// The callback runs while the reader holds its internal lock, so it is
+// serialized per Reader and must not call methods on that Reader (deadlock)
+// or block for long. BytesFetched may advance ahead of BytesRead on the
+// parallel path; on the single-stream fallback the two counters stay equal.
 func WithProgress(fn func(Progress)) Option {
 	return func(c *Config) {
 		c.OnProgress = fn
