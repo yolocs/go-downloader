@@ -15,6 +15,10 @@ import (
 // not match the expected digest. The partial temporary file is removed.
 var ErrDigestMismatch = errors.New("downloader: SHA-256 digest mismatch")
 
+// ErrChunkDigestMismatch is returned when a parallel Range chunk's SHA-256
+// does not match the digest supplied via WithChunkChecksums.
+var ErrChunkDigestMismatch = errors.New("downloader: chunk SHA-256 digest mismatch")
+
 // ParseSHA256Hex decodes a 64-character hexadecimal SHA-256 digest.
 func ParseSHA256Hex(s string) ([]byte, error) {
 	if len(s) != sha256.Size*2 {
@@ -135,6 +139,54 @@ func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, 
 		}
 	}
 	return n, nil
+}
+
+// ChunkChecksumsFromPayload returns SHA-256 digests for each fixed-size
+// chunk of payload, indexed the same way planChunks numbers Range slices.
+func ChunkChecksumsFromPayload(payload []byte, chunkSize int64) [][]byte {
+	ranges := planChunks(int64(len(payload)), chunkSize)
+	out := make([][]byte, len(ranges))
+	for _, br := range ranges {
+		sum := sha256.Sum256(payload[br.Start:br.End])
+		d := make([]byte, sha256.Size)
+		copy(d, sum[:])
+		out[br.Index] = d
+	}
+	return out
+}
+
+func verifyChunkDigest(index int, data, expected []byte) error {
+	if len(expected) != sha256.Size {
+		return fmt.Errorf("downloader: chunk %d expected digest is %d bytes, want %d", index, len(expected), sha256.Size)
+	}
+	got := sha256.Sum256(data)
+	if !digestEqual(got[:], expected) {
+		return fmt.Errorf("%w: chunk %d got %s want %s", ErrChunkDigestMismatch, index, hex.EncodeToString(got[:]), hex.EncodeToString(expected))
+	}
+	return nil
+}
+
+func validateChunkChecksums(digests [][]byte, numChunks int) error {
+	if len(digests) == 0 {
+		return nil
+	}
+	if len(digests) != numChunks {
+		return fmt.Errorf("downloader: chunk checksum count %d != planned chunk count %d", len(digests), numChunks)
+	}
+	var any bool
+	for i, d := range digests {
+		if d == nil {
+			continue
+		}
+		any = true
+		if len(d) != sha256.Size {
+			return fmt.Errorf("downloader: chunk %d checksum must be %d bytes", i, sha256.Size)
+		}
+	}
+	if !any {
+		return fmt.Errorf("downloader: chunk checksums has no non-nil digests")
+	}
+	return nil
 }
 
 func digestEqual(a, b []byte) bool {
