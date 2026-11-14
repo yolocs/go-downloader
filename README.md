@@ -137,11 +137,14 @@ func WithHeader(key, value string) Option
 func WithRetry(policy RetryPolicy) Option
 func WithBufferMemoryLimit(n int64) Option
 func WithProgress(fn func(Progress)) Option
+func WithChunkChecksums(digests [][]byte) Option
 
+func ChunkChecksumsFromPayload(payload []byte, chunkSize int64) [][]byte
 func SaveFile(ctx context.Context, url, path string, expectedSHA256 []byte, opts ...Option) error
 func ParseSHA256Hex(s string) ([]byte, error)
 
 var ErrDigestMismatch = errors.New("downloader: SHA-256 digest mismatch")
+var ErrChunkDigestMismatch = errors.New("downloader: chunk SHA-256 digest mismatch")
 ```
 
 ### Suggested defaults
@@ -304,6 +307,31 @@ decompress and extract on top of the parallel `Reader`:
 | [decompress-gzip](examples/decompress-gzip/) | download → `gzip.Reader` → file or stdout |
 | [extract-targz](examples/extract-targz/) | download → gzip → `tar.Reader` → directory |
 | [decompress-zstd](examples/decompress-zstd/) | download → `zstd.Reader` → file or stdout |
+
+### Per-chunk integrity (parallel path)
+
+`WithChunkChecksums` verifies SHA-256 after each successful Range fetch and
+before the chunk is admitted to the reorder buffer. Digest indices match
+`planChunks` for the probed object size and configured `ChunkSize`.
+A nil slice entry skips verification for that chunk; at least one non-nil
+digest is required. Mismatch surfaces as `ErrChunkDigestMismatch` on the next
+`Read`. Checksums apply only on the parallel Range path — `Open` returns an
+error when the download would use the single-stream fallback.
+
+Build digests offline with `ChunkChecksumsFromPayload`, or supply a manifest
+that matches your chunk size:
+
+```go
+chunk := downloader.DefaultChunkSize
+digests := downloader.ChunkChecksumsFromPayload(corpus, chunk)
+r, err := downloader.Open(ctx, url,
+    downloader.WithChunkSize(chunk),
+    downloader.WithChunkChecksums(digests),
+)
+```
+
+Pass the same option to `SaveFile` to catch corrupted or swapped chunks before
+the stream hash runs.
 
 ### Integrity (atomic file save)
 

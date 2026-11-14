@@ -74,6 +74,7 @@ type Config struct {
 	Retry             RetryPolicy
 	BufferMemoryLimit int64
 	OnProgress        func(Progress)
+	ChunkChecksums    [][]byte
 }
 
 // Option mutates Config during Open.
@@ -159,6 +160,21 @@ func WithParallelThreshold(n int64) Option {
 	}
 }
 
+// WithChunkChecksums sets expected SHA-256 digests for parallel Range chunks.
+// The slice is indexed by chunk number (the same indices as planChunks with
+// the configured ChunkSize). Each element must be nil (skip verification) or
+// exactly 32 bytes. When set, Open requires a parallel Range download; the
+// single-stream fallback returns an error.
+func WithChunkChecksums(digests [][]byte) Option {
+	return func(c *Config) {
+		if digests == nil {
+			c.ChunkChecksums = nil
+			return
+		}
+		c.ChunkChecksums = append([][]byte(nil), digests...)
+	}
+}
+
 func defaultConfig() Config {
 	return Config{
 		ChunkSize:         DefaultChunkSize,
@@ -203,6 +219,9 @@ func Open(ctx context.Context, url string, opts ...Option) (Reader, error) {
 
 	useParallel := info.AcceptRanges && info.Size > 0 && info.Size >= cfg.ParallelThreshold
 	if !useParallel {
+		if len(cfg.ChunkChecksums) > 0 {
+			return nil, fmt.Errorf("downloader: WithChunkChecksums requires a parallel Range download")
+		}
 		return openFallback(ctx, cfg, url, info)
 	}
 	return openParallelReader(ctx, cfg, url, info)

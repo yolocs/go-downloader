@@ -45,6 +45,9 @@ func openParallelReader(ctx context.Context, cfg Config, rawURL string, info obj
 	if len(ranges) == 0 {
 		return nil, fmt.Errorf("downloader: empty plan for size %d", info.Size)
 	}
+	if err := validateChunkChecksums(cfg.ChunkChecksums, len(ranges)); err != nil {
+		return nil, err
+	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	r := &parallelReader{
@@ -179,6 +182,17 @@ func (r *parallelReader) fetch(idx int) {
 		r.cancel() // Stop sibling requests and retry waits on a terminal error.
 		r.cond.Broadcast()
 		return
+	}
+	if digests := r.cfg.ChunkChecksums; idx < len(digests) {
+		if expected := digests[idx]; expected != nil {
+			if err := verifyChunkDigest(idx, data, expected); err != nil {
+				r.reservedBytes -= br.End - br.Start
+				r.err = err
+				r.cancel()
+				r.cond.Broadcast()
+				return
+			}
+		}
 	}
 	r.slots[idx] = data
 	r.bytesFetched += int64(len(data))
