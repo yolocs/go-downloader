@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +39,10 @@ type parallelReader struct {
 	err           error
 	closed        bool
 	wg            sync.WaitGroup
+
+	resumeStatePath string
+	partial         *os.File
+	chunkDone       []bool
 }
 
 func openParallelReader(ctx context.Context, cfg Config, rawURL string, info objectInfo) (*parallelReader, error) {
@@ -47,6 +52,20 @@ func openParallelReader(ctx context.Context, cfg Config, rawURL string, info obj
 	}
 	if err := validateChunkChecksums(cfg.ChunkChecksums, len(ranges)); err != nil {
 		return nil, err
+	}
+
+	var chunkDone []bool
+	var partial *os.File
+	if cfg.Resume != nil {
+		var err error
+		chunkDone, err = validateResume(cfg.Resume, len(ranges), info, rawURL, cfg.ChunkSize)
+		if err != nil {
+			return nil, err
+		}
+		partial, err = openResumePartial(cfg.Resume.PartialPath, info.Size)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -60,10 +79,17 @@ func openParallelReader(ctx context.Context, cfg Config, rawURL string, info obj
 		ctx:          ctx,
 		cancel:       cancel,
 		slots:        make([][]byte, len(ranges)),
+		chunkDone:    chunkDone,
+		partial:      partial,
 	}
+	if cfg.Resume != nil {
+		r.resumeStatePath = cfg.Resume.StatePath
+	}
+
 	r.cond = sync.NewCond(&r.mu)
 
 	r.mu.Lock()
+	r.skipCompletedChunksLocked()
 	r.scheduleLocked()
 	r.mu.Unlock()
 	return r, nil
@@ -110,6 +136,25 @@ func (r *parallelReader) Read(p []byte) (int, error) {
 			r.buf = data
 			continue
 		}
+		if r.chunkDone != nil && r.chunkDone[r.nextToDeliver] {
+			br := r.ranges[r.nextToDeliver]
+			data, err := r.loadPartialChunk(br)
+			if err != nil {
+				r.err = err
+				return 0, err
+			}
+			if digests := r.cfg.ChunkChecksums; r.nextToDeliver < len(digests) {
+				if expected := digests[r.nextToDeliver]; expected != nil {
+					if err := verifyChunkDigest(r.nextToDeliver, data, expected); err != nil {
+						r.err = err
+						r.cancel()
+						return 0, err
+					}
+				}
+			}
+			r.buf = data
+			continue
+		}
 		if r.err != nil {
 			return 0, r.err
 		}
@@ -131,9 +176,26 @@ func (r *parallelReader) Close() error {
 		r.slots[i] = nil
 	}
 	r.cond.Broadcast()
+	partial := r.partial
 	r.mu.Unlock()
 	r.wg.Wait()
+	if partial != nil {
+		_ = partial.Close()
+	}
 	return nil
+}
+
+// skipCompletedChunksLocked advances nextToFetch past chunks already on disk.
+// Caller must hold r.mu.
+func (r *parallelReader) skipCompletedChunksLocked() {
+	if r.chunkDone == nil {
+		return
+	}
+	for r.nextToFetch < len(r.ranges) && r.chunkDone[r.nextToFetch] {
+		br := r.ranges[r.nextToFetch]
+		r.bytesFetched += br.End - br.Start
+		r.nextToFetch++
+	}
 }
 
 // scheduleLocked launches fetch goroutines while under the prefetch / concurrency caps.
@@ -142,6 +204,7 @@ func (r *parallelReader) scheduleLocked() {
 	if r.closed || r.err != nil {
 		return
 	}
+	r.skipCompletedChunksLocked()
 	for r.inflight < r.cfg.Concurrency &&
 		r.nextToFetch < len(r.ranges) &&
 		r.nextToFetch-r.nextToDeliver < r.cfg.PrefetchWindow {
@@ -186,6 +249,25 @@ func (r *parallelReader) fetch(idx int) {
 	if digests := r.cfg.ChunkChecksums; idx < len(digests) {
 		if expected := digests[idx]; expected != nil {
 			if err := verifyChunkDigest(idx, data, expected); err != nil {
+				r.reservedBytes -= br.End - br.Start
+				r.err = err
+				r.cancel()
+				r.cond.Broadcast()
+				return
+			}
+		}
+	}
+	if r.partial != nil {
+		if err := r.writePartialChunk(idx, data); err != nil {
+			r.reservedBytes -= br.End - br.Start
+			r.err = err
+			r.cancel()
+			r.cond.Broadcast()
+			return
+		}
+		if r.chunkDone != nil {
+			r.chunkDone[idx] = true
+			if err := r.persistChunkMapLocked(); err != nil {
 				r.reservedBytes -= br.End - br.Start
 				r.err = err
 				r.cancel()

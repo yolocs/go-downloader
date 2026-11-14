@@ -44,7 +44,7 @@ Add new items at the end of the matching section as ideas appear.
 - [x] ~~Streaming decompress / extract examples (`gzip` / `zstd` / `tar`)~~
 - [x] ~~Integrity: final stream hash (e.g. SHA-256) before rename-into-place~~
 - [x] ~~Integrity: optional per-chunk checksums~~
-- [ ] Resumable downloads (`WithResume` / persisted chunk map)
+- [x] ~~Resumable downloads (`WithResume` / persisted chunk map)~~
 - [ ] Partial object read (`WithRange(start, end)`)
 - [ ] Progress / metrics exporters (bytes/sec, chunk latency)
 - [ ] Auth / custom transport docs (`WithHTTPClient`, headers)

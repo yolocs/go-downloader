@@ -138,13 +138,16 @@ func WithRetry(policy RetryPolicy) Option
 func WithBufferMemoryLimit(n int64) Option
 func WithProgress(fn func(Progress)) Option
 func WithChunkChecksums(digests [][]byte) Option
+func WithResume(paths ResumePaths) Option
 
 func ChunkChecksumsFromPayload(payload []byte, chunkSize int64) [][]byte
+func ResumeSaveFile(ctx context.Context, url, path, statePath string, expectedSHA256 []byte, opts ...Option) error
 func SaveFile(ctx context.Context, url, path string, expectedSHA256 []byte, opts ...Option) error
 func ParseSHA256Hex(s string) ([]byte, error)
 
 var ErrDigestMismatch = errors.New("downloader: SHA-256 digest mismatch")
 var ErrChunkDigestMismatch = errors.New("downloader: chunk SHA-256 digest mismatch")
+var ErrResumeStateInvalid = errors.New("downloader: resume state invalid")
 ```
 
 ### Suggested defaults
@@ -332,6 +335,28 @@ r, err := downloader.Open(ctx, url,
 
 Pass the same option to `SaveFile` to catch corrupted or swapped chunks before
 the stream hash runs.
+
+### Resumable downloads
+
+`WithResume` pairs a JSON chunk map at `ResumePaths.StatePath` with a sparse
+partial file at `ResumePaths.PartialPath`. Each successful Range fetch is
+written at the correct offset and the map is updated atomically. On a later
+`Open`, completed chunks are served from the partial file without
+re-fetching. Resume requires a parallel Range download (same constraints as
+`WithChunkChecksums`).
+
+`ResumeSaveFile` writes directly to the destination path, verifies SHA-256
+after the full object is read, and removes the state file on success.
+
+```go
+state := path + ".resume.json"
+err := downloader.ResumeSaveFile(ctx, url, path, state, expectedSHA256,
+    downloader.WithConcurrency(8),
+)
+if errors.Is(err, downloader.ErrResumeStateInvalid) {
+    os.Remove(state) // object or layout changed; start fresh
+}
+```
 
 ### Integrity (atomic file save)
 
