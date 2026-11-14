@@ -75,6 +75,7 @@ type Config struct {
 	BufferMemoryLimit int64
 	OnProgress        func(Progress)
 	ChunkChecksums    [][]byte
+	Resume            *ResumePaths
 }
 
 // Option mutates Config during Open.
@@ -221,6 +222,9 @@ func Open(ctx context.Context, url string, opts ...Option) (Reader, error) {
 	if !useParallel {
 		if len(cfg.ChunkChecksums) > 0 {
 			return nil, fmt.Errorf("downloader: WithChunkChecksums requires a parallel Range download")
+		}
+		if cfg.Resume != nil {
+			return nil, fmt.Errorf("downloader: WithResume requires a parallel Range download")
 		}
 		return openFallback(ctx, cfg, url, info)
 	}
